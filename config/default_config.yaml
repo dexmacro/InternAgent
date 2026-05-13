@@ -137,6 +137,13 @@ agents:
     model_provider: "default"
     max_papers: 50
     sources: ["arxiv", "crossref", "web_search"]
+    # Citation-graph mode settings (used when seed_paper is provided)
+    citation_graph:
+      depth: 2                    # BFS depth (1 = direct references only)
+      max_refs_per_paper: 30      # Max references fetched per paper
+      include_citing_papers: false  # Also expand papers that cite the seed
+      save_dot: false             # Save a Graphviz DOT file
+      save_png: false             # Render a PNG image (requires graphviz or matplotlib)
 
   # DR Agent
   dr:

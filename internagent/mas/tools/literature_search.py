@@ -48,6 +48,7 @@ class PaperMetadata:
     citations: Optional[int] = None
     pdf_url: Optional[str] = None
     source: str = "unknown"  # Source: arxiv, semantic_scholar, crossref, core
+    paper_id: Optional[str] = None  # Semantic Scholar paper ID
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
@@ -233,7 +234,7 @@ class LiteratureSearch:
         params = {
             "query": query,
             "limit": min(max_results, 100),  # API limit
-            "fields": "title,abstract,authors,year,venue,url,citationCount,externalIds,openAccessPdf"
+            "fields": "paperId,title,abstract,authors,year,venue,url,citationCount,externalIds,openAccessPdf"
         }
         
         try:
@@ -268,7 +269,8 @@ class LiteratureSearch:
                             url=item.get("url"),
                             citations=item.get("citationCount"),
                             pdf_url=pdf_info.get("url") if pdf_info else None,
-                            source="semantic_scholar"
+                            source="semantic_scholar",
+                            paper_id=item.get("paperId")
                         )
                         papers.append(paper)
                     
@@ -645,6 +647,256 @@ class LiteratureSearch:
         self._cache.clear()
         logger.info("Cache cleared")
     
+    # ------------------------------------------------------------------
+    # Citation-graph helpers
+    # ------------------------------------------------------------------
+
+    def _make_s2_headers(self) -> Dict[str, str]:
+        """Build headers for Semantic Scholar API requests."""
+        headers = dict(self.headers)
+        api_key = os.getenv("S2_API_KEY") or self.api_keys.get("semantic_scholar")
+        if api_key:
+            headers["x-api-key"] = api_key
+        return headers
+
+    async def resolve_paper_id(self, identifier: str) -> Optional[str]:
+        """
+        Resolve a paper identifier (title, DOI, or arXiv ID) to a Semantic Scholar
+        paper ID.
+
+        The method probes the identifier in this order:
+        1. If it looks like an arXiv ID (e.g. ``2301.01234`` or ``cs.LG/0612046``)
+           it queries ``/paper/ARXIV:{id}``.
+        2. If it looks like a DOI (contains ``/`` but is not clearly a title) it
+           queries ``/paper/DOI:{doi}``.
+        3. Otherwise it performs a full-text search and returns the top hit's ID.
+
+        Args:
+            identifier: Paper title, DOI, or arXiv ID string.
+
+        Returns:
+            Semantic Scholar ``paperId`` string, or ``None`` if not found.
+        """
+        cache_key = f"resolve:{identifier}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]  # type: ignore[return-value]
+
+        headers = self._make_s2_headers()
+        base = "https://api.semanticscholar.org/graph/v1/paper"
+        fields = "paperId,title,externalIds"
+
+        async def _fetch_paper(pid: str) -> Optional[str]:
+            url = f"{base}/{pid}"
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(
+                        url, params={"fields": fields}, headers=headers
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return data.get("paperId")
+            except Exception as e:
+                logger.debug(f"[resolve_paper_id] Probe {pid} failed: {e}")
+            return None
+
+        paper_id: Optional[str] = None
+
+        # 1. ArXiv ID heuristic: digits with a dot, or old-style category/YYMM.NNNNN
+        arxiv_pattern = re.compile(r"^(\d{4}\.\d{4,5}(v\d+)?|[a-zA-Z\-]+/\d{7})$")
+        if arxiv_pattern.match(identifier.strip()):
+            paper_id = await _fetch_paper(f"ARXIV:{identifier.strip()}")
+
+        # 2. DOI heuristic: contains "/" but does not look like a sentence
+        if paper_id is None and "/" in identifier and " " not in identifier:
+            paper_id = await _fetch_paper(f"DOI:{identifier.strip()}")
+
+        # 3. Title / keyword search fallback
+        if paper_id is None:
+            try:
+                await asyncio.sleep(1)
+                timeout = aiohttp.ClientTimeout(total=self.timeout)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(
+                        f"{base}/search",
+                        params={"query": identifier, "limit": 1, "fields": fields},
+                        headers=headers,
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            hits = data.get("data", [])
+                            if hits:
+                                paper_id = hits[0].get("paperId")
+            except Exception as e:
+                logger.error(f"[resolve_paper_id] Search fallback failed: {e}")
+
+        self._cache[cache_key] = paper_id  # type: ignore[assignment]
+        return paper_id
+
+    async def get_references_by_paper_id(
+        self, paper_id: str, max_results: int = 50
+    ) -> List[PaperMetadata]:
+        """
+        Fetch the reference list of a paper via the Semantic Scholar API.
+
+        Calls ``GET /paper/{paper_id}/references`` and returns the papers that
+        *this* paper cites (i.e. its bibliography).
+
+        Args:
+            paper_id: Semantic Scholar ``paperId`` (or ``ARXIV:…`` / ``DOI:…``
+                      prefixed identifier).
+            max_results: Maximum number of references to return.
+
+        Returns:
+            List of :class:`PaperMetadata` objects for each referenced paper.
+        """
+        cache_key = f"refs:{paper_id}:{max_results}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]  # type: ignore[return-value]
+
+        url = (
+            f"https://api.semanticscholar.org/graph/v1/paper/{paper_id}/references"
+        )
+        fields = (
+            "paperId,title,abstract,authors,year,venue,url,"
+            "citationCount,externalIds,openAccessPdf"
+        )
+        params: Dict[str, Any] = {"fields": fields, "limit": min(max_results, 1000)}
+        headers = self._make_s2_headers()
+
+        papers: List[PaperMetadata] = []
+        try:
+            await asyncio.sleep(1)
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, params=params, headers=headers) as resp:
+                    if resp.status == 429:
+                        logger.warning("[S2 references] Rate limited")
+                        await asyncio.sleep(5)
+                        return []
+                    if resp.status != 200:
+                        logger.error(
+                            f"[S2 references] Request failed: {resp.status}"
+                        )
+                        return []
+                    data = await resp.json()
+                    for entry in data.get("data", []):
+                        cited = entry.get("citedPaper", {})
+                        if not cited or not cited.get("title"):
+                            continue
+                        authors = [
+                            a.get("name", "") for a in cited.get("authors", [])
+                        ]
+                        ext_ids = cited.get("externalIds") or {}
+                        pdf_info = cited.get("openAccessPdf") or {}
+                        paper = PaperMetadata(
+                            title=cited.get("title", ""),
+                            authors=authors,
+                            abstract=cited.get("abstract") or "",
+                            year=cited.get("year"),
+                            doi=ext_ids.get("DOI"),
+                            journal=cited.get("venue"),
+                            url=cited.get("url"),
+                            citations=cited.get("citationCount"),
+                            pdf_url=pdf_info.get("url"),
+                            source="semantic_scholar",
+                            paper_id=cited.get("paperId"),
+                        )
+                        papers.append(paper)
+                        self.citation_manager.add_paper(paper)
+        except asyncio.TimeoutError:
+            logger.error("[S2 references] Request timeout")
+        except Exception as e:
+            logger.error(f"[S2 references] Error: {e}")
+
+        self._cache[cache_key] = papers
+        logger.info(
+            f"[S2 references] Found {len(papers)} references for {paper_id}"
+        )
+        return papers
+
+    async def get_citing_papers(
+        self, paper_id: str, max_results: int = 50
+    ) -> List[PaperMetadata]:
+        """
+        Fetch papers that cite the given paper via the Semantic Scholar API.
+
+        Calls ``GET /paper/{paper_id}/citations`` and returns papers that *cite*
+        this paper (i.e. papers that appear in other works' reference lists).
+
+        Args:
+            paper_id: Semantic Scholar ``paperId`` (or ``ARXIV:…`` / ``DOI:…``
+                      prefixed identifier).
+            max_results: Maximum number of citing papers to return.
+
+        Returns:
+            List of :class:`PaperMetadata` objects for each citing paper.
+        """
+        cache_key = f"cites:{paper_id}:{max_results}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]  # type: ignore[return-value]
+
+        url = (
+            f"https://api.semanticscholar.org/graph/v1/paper/{paper_id}/citations"
+        )
+        fields = (
+            "paperId,title,abstract,authors,year,venue,url,"
+            "citationCount,externalIds,openAccessPdf"
+        )
+        params: Dict[str, Any] = {"fields": fields, "limit": min(max_results, 1000)}
+        headers = self._make_s2_headers()
+
+        papers: List[PaperMetadata] = []
+        try:
+            await asyncio.sleep(1)
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, params=params, headers=headers) as resp:
+                    if resp.status == 429:
+                        logger.warning("[S2 citations] Rate limited")
+                        await asyncio.sleep(5)
+                        return []
+                    if resp.status != 200:
+                        logger.error(
+                            f"[S2 citations] Request failed: {resp.status}"
+                        )
+                        return []
+                    data = await resp.json()
+                    for entry in data.get("data", []):
+                        citing = entry.get("citingPaper", {})
+                        if not citing or not citing.get("title"):
+                            continue
+                        authors = [
+                            a.get("name", "") for a in citing.get("authors", [])
+                        ]
+                        ext_ids = citing.get("externalIds") or {}
+                        pdf_info = citing.get("openAccessPdf") or {}
+                        paper = PaperMetadata(
+                            title=citing.get("title", ""),
+                            authors=authors,
+                            abstract=citing.get("abstract") or "",
+                            year=citing.get("year"),
+                            doi=ext_ids.get("DOI"),
+                            journal=citing.get("venue"),
+                            url=citing.get("url"),
+                            citations=citing.get("citationCount"),
+                            pdf_url=pdf_info.get("url"),
+                            source="semantic_scholar",
+                            paper_id=citing.get("paperId"),
+                        )
+                        papers.append(paper)
+                        self.citation_manager.add_paper(paper)
+        except asyncio.TimeoutError:
+            logger.error("[S2 citations] Request timeout")
+        except Exception as e:
+            logger.error(f"[S2 citations] Error: {e}")
+
+        self._cache[cache_key] = papers
+        logger.info(
+            f"[S2 citations] Found {len(papers)} citing papers for {paper_id}"
+        )
+        return papers
+
     def _parse_arxiv_xml(self, xml_data: str) -> List[PaperMetadata]:
         """
         Parse arXiv XML response
