@@ -15,11 +15,17 @@ import os
 import asyncio
 from .base_agent import BaseAgent, AgentExecutionError
 from ..tools.literature_search import LiteratureSearch, PaperMetadata
+from ..tools.citation_graph import CitationGraph
 from ..tools.web_search import WebSearch
 from ..tools.utils import parse_io_description, format_papers_for_printing_next_query,\
     download_pdf, extract_text_from_pdf, download_pdf_by_doi, select_papers
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of characters from a paper's text fed into the deep-read LLM
+# prompt.  Keeps prompts within typical context-window budgets while covering
+# the most information-dense sections of a paper.
+_DEEP_READ_MAX_CHARS = 8000
 
 
 class SurveyAgent(BaseAgent):
@@ -96,16 +102,33 @@ class SurveyAgent(BaseAgent):
         """
         Execute survey agent with configurable search sources.
         
+        When ``context`` contains a ``seed_paper`` key the agent switches into
+        *citation-graph mode* and calls :meth:`build_citation_graph` instead of
+        the regular keyword-based survey.
+
         Args:
-            context: Context dictionary containing research topic information
-            params: Parameters including optional 'search_sources' to specify which search tools to use
-                   Available sources: 'literature_search', 'web_search'
+            context: Context dictionary containing research topic information.
+                     Set ``seed_paper`` (title / DOI / arXiv ID) to trigger
+                     citation-graph mode.
+            params: Parameters including optional 'search_sources' to specify
+                    which search tools to use.
+                    Available sources: 'literature_search', 'web_search'
         
         Returns:
             Dict containing:
                 - 'papers': List of academic papers (from literature_search)
                 - 'web_results': List of web pages (from web_search)
+            Or in citation-graph mode:
+                - 'citation_graph': serialised graph dict (nodes + edges)
+                - 'papers': flat list of all paper dicts in the graph
+                - 'graph_json_path': path to the saved JSON file (if any)
+                - 'graph_dot_path': path to the saved DOT file (if any)
+                - 'graph_png_path': path to the saved PNG file (if any)
         """
+        # --- Citation-graph mode ---
+        if context.get("seed_paper"):
+            return await self.build_citation_graph(context, params)
+
         results = {
             "papers": [],
             "web_results": []
@@ -557,3 +580,299 @@ class SurveyAgent(BaseAgent):
             p['is_deep_read'] = (p['id'] in selected_ids)
 
         return paper_bank, search_queries
+
+    # ------------------------------------------------------------------
+    # Citation-graph mode
+    # ------------------------------------------------------------------
+
+    async def build_citation_graph(
+        self, context: Dict[str, Any], params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Build a directed citation graph starting from a seed paper.
+
+        Starting from the paper identified by ``context["seed_paper"]``, the
+        method performs a BFS expansion up to ``context.get("depth", 2)``
+        levels deep, collecting all referenced papers at each level.  Optionally
+        it also collects papers that cite the seed paper when
+        ``context.get("include_citing_papers", False)`` is ``True``.
+
+        For every paper encountered the agent attempts a deep-read analysis
+        (download PDF → extract text → call LLM) that populates the following
+        structured fields on each graph node:
+
+        - ``problem_and_background`` – the research problem the paper addresses
+        - ``contributions`` – key contributions / solutions introduced
+        - ``methods`` – technical approach
+        - ``challenges`` – challenges faced / open problems
+        - ``limitations_and_future_work`` – limitations and future directions
+
+        Results are serialised to JSON (and optionally DOT / PNG) under the
+        ``output_dir`` path (default ``tmp/citation_graph``).
+
+        Args:
+            context: Must contain ``seed_paper`` (str – title, DOI, or arXiv
+                     ID).  Recognised optional keys:
+
+                     - ``depth`` (int, default ``2``) – BFS depth limit
+                     - ``max_refs_per_paper`` (int, default ``30``) – max
+                       references to fetch per paper
+                     - ``include_citing_papers`` (bool, default ``False``) –
+                       also fetch papers that cite the seed
+                     - ``output_dir`` (str, default ``"tmp/citation_graph"``) –
+                       directory for output files
+                     - ``save_dot`` (bool, default ``False``) – save DOT file
+                     - ``save_png`` (bool, default ``False``) – save PNG file
+            params: Unused; reserved for future extensions.
+
+        Returns:
+            Dict containing:
+            - ``citation_graph`` – :meth:`CitationGraph.to_json` dict
+            - ``papers`` – flat list of all paper dicts in the graph
+            - ``graph_json_path`` – path to the JSON output file
+            - ``graph_dot_path`` – path to DOT file or ``None``
+            - ``graph_png_path`` – path to PNG file or ``None``
+
+        Raises:
+            :class:`AgentExecutionError` – when the seed paper cannot be
+                resolved or the literature search tool is not initialised.
+        """
+        if not self.literature_search:
+            raise AgentExecutionError(
+                "Literature search tool not initialised; cannot build citation graph."
+            )
+
+        seed_identifier: str = context["seed_paper"]
+        depth: int = int(context.get("depth", 2))
+        max_refs: int = int(context.get("max_refs_per_paper", 30))
+        include_citing: bool = bool(context.get("include_citing_papers", False))
+        output_dir: str = context.get("output_dir", "tmp/citation_graph")
+        do_save_dot: bool = bool(context.get("save_dot", False))
+        do_save_png: bool = bool(context.get("save_png", False))
+
+        os.makedirs(output_dir, exist_ok=True)
+        pdf_dir = os.path.join(output_dir, "pdf")
+        os.makedirs(pdf_dir, exist_ok=True)
+
+        graph = CitationGraph()
+
+        # -----------------------------------------------------------
+        # 1. Resolve seed paper → Semantic Scholar paper ID
+        # -----------------------------------------------------------
+        logger.info(f"[CitationGraph] Resolving seed paper: {seed_identifier!r}")
+        seed_s2_id = await self.literature_search.resolve_paper_id(seed_identifier)
+        if not seed_s2_id:
+            raise AgentExecutionError(
+                f"Could not resolve seed paper {seed_identifier!r} to a "
+                f"Semantic Scholar paper ID."
+            )
+        logger.info(f"[CitationGraph] Seed S2 ID: {seed_s2_id}")
+
+        # Build a minimal seed node from what we have so far; it will be
+        # enriched during the deep-read pass.
+        seed_node_dict: Dict[str, Any] = {
+            "title": seed_identifier,
+            "authors": [],
+            "paper_id": seed_s2_id,
+            "source": "semantic_scholar",
+        }
+        seed_key = graph.add_paper(seed_node_dict, depth=0)
+
+        # -----------------------------------------------------------
+        # 2. BFS expansion
+        # -----------------------------------------------------------
+        # frontier: list of (node_key, s2_paper_id, current_depth)
+        frontier: List[Tuple[str, str, int]] = [(seed_key, seed_s2_id, 0)]
+        visited_ids: Set[str] = {seed_s2_id}
+
+        # Optionally seed the graph with citing papers (depth-0 inverse edges)
+        if include_citing:
+            logger.info("[CitationGraph] Fetching papers that cite the seed…")
+            citing_papers = await self.literature_search.get_citing_papers(
+                seed_s2_id, max_results=max_refs
+            )
+            for cp in citing_papers:
+                cp_dict = {
+                    "title": cp.title,
+                    "authors": cp.authors,
+                    "abstract": cp.abstract,
+                    "year": cp.year,
+                    "doi": cp.doi,
+                    "journal": cp.journal,
+                    "url": cp.url,
+                    "citations": cp.citations,
+                    "pdf_url": cp.pdf_url,
+                    "source": cp.source,
+                    "paper_id": cp.paper_id,
+                }
+                cp_key = graph.add_paper(cp_dict, depth=1)
+                graph.add_citation(cp_key, seed_key)
+                if cp.paper_id and cp.paper_id not in visited_ids and depth > 1:
+                    visited_ids.add(cp.paper_id)
+                    frontier.append((cp_key, cp.paper_id, 1))
+
+        while frontier:
+            node_key, s2_id, current_depth = frontier.pop(0)
+
+            if current_depth >= depth:
+                continue  # do not expand further than requested depth
+
+            logger.info(
+                f"[CitationGraph] Expanding depth {current_depth+1} "
+                f"from node {node_key!r} (S2={s2_id})"
+            )
+            refs = await self.literature_search.get_references_by_paper_id(
+                s2_id, max_results=max_refs
+            )
+
+            for ref in refs:
+                ref_dict: Dict[str, Any] = {
+                    "title": ref.title,
+                    "authors": ref.authors,
+                    "abstract": ref.abstract,
+                    "year": ref.year,
+                    "doi": ref.doi,
+                    "journal": ref.journal,
+                    "url": ref.url,
+                    "citations": ref.citations,
+                    "pdf_url": ref.pdf_url,
+                    "source": ref.source,
+                    "paper_id": ref.paper_id,
+                }
+                ref_key = graph.add_paper(ref_dict, depth=current_depth + 1)
+                graph.add_citation(node_key, ref_key)
+
+                if ref.paper_id and ref.paper_id not in visited_ids:
+                    visited_ids.add(ref.paper_id)
+                    frontier.append((ref_key, ref.paper_id, current_depth + 1))
+
+        logger.info(
+            f"[CitationGraph] BFS complete. "
+            f"{len(graph)} nodes, {len(graph.node_keys())} unique papers."
+        )
+
+        # -----------------------------------------------------------
+        # 3. Deep-read analysis for all papers with a URL / DOI
+        # -----------------------------------------------------------
+        deep_read_schema = {
+            "type": "object",
+            "properties": {
+                "problem_and_background": {"type": "string"},
+                "contributions": {"type": "string"},
+                "methods": {"type": "string"},
+                "challenges": {"type": "string"},
+                "limitations_and_future_work": {"type": "string"},
+            },
+            "required": [
+                "problem_and_background",
+                "contributions",
+                "methods",
+                "challenges",
+                "limitations_and_future_work",
+            ],
+        }
+
+        semaphore = asyncio.Semaphore(self.max_concurrent_tasks)
+
+        async def _deep_read_node(nk: str) -> None:
+            async with semaphore:
+                node = graph.get_node(nk)
+                if not node:
+                    return
+
+                # Skip if all analysis fields are already populated
+                if all(node.get(ak) for ak in (
+                    "problem_and_background", "contributions",
+                    "methods", "challenges", "limitations_and_future_work"
+                )):
+                    return
+
+                url = node.get("url")
+                doi = node.get("doi")
+                abstract = node.get("abstract") or ""
+
+                # Prefer abstract-only analysis when no PDF is available; it
+                # still yields useful structured output.
+                text: Optional[str] = None
+
+                if url or doi:
+                    pdf_path = None
+                    try:
+                        if url:
+                            pdf_path = download_pdf(url, save_folder=pdf_dir)
+                        if doi and not pdf_path:
+                            pdf_path = download_pdf_by_doi(
+                                doi=doi, download_dir=pdf_dir
+                            )
+                        if pdf_path:
+                            text = extract_text_from_pdf(pdf_path)
+                    except Exception as e:
+                        logger.debug(f"[CitationGraph] PDF fetch failed for {nk}: {e}")
+
+                if not text and abstract:
+                    text = abstract  # fall back to abstract
+
+                if not text:
+                    return
+
+                prompt = (
+                    f"Analyze the following academic paper content and extract "
+                    f"structured information:\n\n{text[:_DEEP_READ_MAX_CHARS]}\n\n"
+                    f"Return JSON with exactly these keys:\n"
+                    f"- problem_and_background: the research problem and context\n"
+                    f"- contributions: key contributions and solutions\n"
+                    f"- methods: technical approach and methodology\n"
+                    f"- challenges: challenges faced and open problems\n"
+                    f"- limitations_and_future_work: limitations and future directions\n"
+                    f"Return valid JSON only."
+                )
+                try:
+                    analysis = await self._call_model(
+                        prompt=prompt, schema=deep_read_schema
+                    )
+                    graph.update_analysis(nk, analysis)
+                except Exception as e:
+                    logger.warning(
+                        f"[CitationGraph] LLM analysis failed for {nk}: {e}"
+                    )
+
+        # Run deep-read for all nodes concurrently (bounded by semaphore)
+        tasks = [
+            asyncio.create_task(_deep_read_node(nk))
+            for nk in graph.node_keys()
+        ]
+        await asyncio.gather(*tasks)
+
+        # -----------------------------------------------------------
+        # 4. Serialise outputs
+        # -----------------------------------------------------------
+        json_path = os.path.join(output_dir, "citation_graph.json")
+        graph.save_json(json_path)
+
+        dot_path: Optional[str] = None
+        png_path: Optional[str] = None
+
+        if do_save_dot:
+            dot_path = os.path.join(output_dir, "citation_graph.dot")
+            graph.save_dot(dot_path)
+
+        if do_save_png:
+            png_path = os.path.join(output_dir, "citation_graph.png")
+            if not graph.save_png(png_path):
+                png_path = None
+
+        # Flatten nodes to a list of dicts for callers that expect `papers`
+        flat_papers = [graph.get_node(nk) for nk in graph.node_keys()]
+
+        logger.info(
+            f"[CitationGraph] Done. {len(flat_papers)} papers. "
+            f"JSON → {json_path}"
+        )
+
+        return {
+            "citation_graph": graph.to_json(),
+            "papers": flat_papers,
+            "graph_json_path": json_path,
+            "graph_dot_path": dot_path,
+            "graph_png_path": png_path,
+        }
