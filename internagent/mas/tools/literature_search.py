@@ -32,6 +32,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Pre-compiled pattern used in resolve_paper_id() to detect arXiv identifiers.
+_ARXIV_ID_RE = re.compile(
+    r"^(\d{4}\.\d{4,5}(v\d+)?|[a-zA-Z\-]+/\d{7})$"
+)
+
 
 @dataclass
 class PaperMetadata:
@@ -703,8 +708,7 @@ class LiteratureSearch:
         paper_id: Optional[str] = None
 
         # 1. ArXiv ID heuristic: digits with a dot, or old-style category/YYMM.NNNNN
-        arxiv_pattern = re.compile(r"^(\d{4}\.\d{4,5}(v\d+)?|[a-zA-Z\-]+/\d{7})$")
-        if arxiv_pattern.match(identifier.strip()):
+        if _ARXIV_ID_RE.match(identifier.strip()):
             paper_id = await _fetch_paper(f"ARXIV:{identifier.strip()}")
 
         # 2. DOI heuristic: contains "/" but does not look like a sentence

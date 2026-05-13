@@ -16,14 +16,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import subprocess
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-try:
-    import networkx as nx
-except ImportError:  # pragma: no cover
-    import subprocess
-    subprocess.check_call(["pip", "install", "networkx"])
-    import networkx as nx
+import networkx as nx
 
 logger = logging.getLogger(__name__)
 
@@ -257,7 +254,6 @@ class CitationGraph:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 
         # --- try graphviz dot binary ---
-        import shutil, subprocess as _sp
         dot_bin = shutil.which("dot")
         if dot_bin:
             dot_src = self.to_dot()
@@ -265,7 +261,7 @@ class CitationGraph:
             try:
                 with open(dot_tmp, "w", encoding="utf-8") as fh:
                     fh.write(dot_src)
-                result = _sp.run(
+                result = subprocess.run(
                     [dot_bin, "-Tpng", dot_tmp, "-o", path],
                     capture_output=True,
                     timeout=60,

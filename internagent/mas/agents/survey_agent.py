@@ -22,6 +22,11 @@ from ..tools.utils import parse_io_description, format_papers_for_printing_next_
 
 logger = logging.getLogger(__name__)
 
+# Maximum number of characters from a paper's text fed into the deep-read LLM
+# prompt.  Keeps prompts within typical context-window budgets while covering
+# the most information-dense sections of a paper.
+_DEEP_READ_MAX_CHARS = 8000
+
 
 class SurveyAgent(BaseAgent):
     """
@@ -678,7 +683,7 @@ class SurveyAgent(BaseAgent):
         # -----------------------------------------------------------
         # frontier: list of (node_key, s2_paper_id, current_depth)
         frontier: List[Tuple[str, str, int]] = [(seed_key, seed_s2_id, 0)]
-        visited_ids: set = {seed_s2_id}
+        visited_ids: Set[str] = {seed_s2_id}
 
         # Optionally seed the graph with citing papers (depth-0 inverse edges)
         if include_citing:
@@ -812,7 +817,7 @@ class SurveyAgent(BaseAgent):
 
                 prompt = (
                     f"Analyze the following academic paper content and extract "
-                    f"structured information:\n\n{text[:8000]}\n\n"
+                    f"structured information:\n\n{text[:_DEEP_READ_MAX_CHARS]}\n\n"
                     f"Return JSON with exactly these keys:\n"
                     f"- problem_and_background: the research problem and context\n"
                     f"- contributions: key contributions and solutions\n"
